@@ -2,6 +2,7 @@ from hashlib import pbkdf2_hmac
 from passlib.hash import nthash
 import msal
 import json
+import jwt
 import sys
 import os
 from pathlib import Path
@@ -21,6 +22,7 @@ import random
 import uuid
 import datetime
 import xmltodict
+from _aad_certificate_manager import ensure_identity
 
 aadsync_server=        "adminwebservice.microsoftonline.com"
 aadsync_client_version="8.0"
@@ -76,12 +78,20 @@ class AADInternals():
         self.dirsync_app = None
         self.dirsync_token_cache = None
 
-        from _aad_certificate_manager import ensure_identity
-        identity = ensure_identity(self.entra_aba_dir, tenant_id,
-                                   proxies=self.proxies, verify=self.verify)
-        self.app = msal.ConfidentialClientApplication(
+        # SSO delegated credentials are isolated from the PFX and held in RAM only.
+        self.sso_app = None
+        self.sso_token_cache = None
+        
+        self.app = self._initialize_confidential_client_app()
+
+    def refresh_confidential_client_app(self) -> None:
+        self.app = self._initialize_confidential_client_app()
+
+    def _initialize_confidential_client_app(self) -> dict:
+        identity = ensure_identity(self.entra_aba_dir, self.tenant_id, proxies=self.proxies, verify=self.verify)
+        return msal.ConfidentialClientApplication(
             identity["app_id"],
-            authority=f"https://login.microsoftonline.com/{tenant_id}",
+            authority=f"https://login.microsoftonline.com/{self.tenant_id}",
             client_credential={
                 "private_key_pfx_path": str(identity["pfx_path"]),
                 "passphrase": identity["passphrase"],
@@ -90,10 +100,15 @@ class AADInternals():
             verify=self.verify,
         )
 
-        # SSO delegated credentials are isolated from the PFX and held in RAM only.
-        self.sso_app = None
-        self.sso_token_cache = None
 
+    def get_token_claims(self, scopes=None) -> dict:
+        '''Claims of our own application token. Not verified: we only read what Entra
+        granted us, we do not authorise anything with it.'''
+        return jwt.decode(self.get_token(scopes=scopes), options={'verify_signature': False})
+
+    def get_token_roles(self, scopes=None) -> list[str]:
+        return self.get_token_claims(scopes=scopes).get('roles') or []
+        
     def get_token(self, scopes=None):
         if scopes is None:
             scopes = [SYNC_SCOPE]
